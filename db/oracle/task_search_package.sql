@@ -39,20 +39,38 @@ CREATE OR REPLACE PACKAGE BODY task_search_pkg AS
         p_results     OUT task_cursor,
         p_total_count OUT NUMBER
     ) IS
-        v_term   VARCHAR2(257);
-        v_offset NUMBER;
+        -- Input is capped at 255 chars; escaping can double it, plus two wildcards.
+        -- The old VARCHAR2(257) raised ORA-06502 for any term longer than 255 chars.
+        v_term      VARCHAR2(600 CHAR);
+        v_status    VARCHAR2(20);
+        v_page      NUMBER;
+        v_page_size NUMBER;
+        v_offset    NUMBER;
     BEGIN
-        v_term   := '%' || LOWER(NVL(p_search_term, '')) || '%';
-        v_offset := (p_page - 1) * p_page_size;
+        -- Escape LIKE wildcards so % and _ in user input match literally ('!' is the escape char)
+        v_term := '%'
+               || REPLACE(REPLACE(REPLACE(
+                      LOWER(SUBSTR(TRIM(p_search_term), 1, 255)),
+                      '!', '!!'), '%', '!%'), '_', '!_')
+               || '%';
+        v_status := UPPER(SUBSTR(TRIM(p_status), 1, 20));
 
-        -- Total count for pagination metadata
+        -- Guard paging input: NULL, zero or negative values previously produced a
+        -- negative offset and silently returned the wrong window.
+        v_page      := GREATEST(NVL(TRUNC(p_page), 1), 1);
+        v_page_size := LEAST(GREATEST(NVL(TRUNC(p_page_size), 10), 1), 100);
+        v_offset    := (v_page - 1) * v_page_size;
+
+        -- Total count for pagination metadata.
+        -- The OR must stay parenthesised: AND binds tighter than OR, and without the
+        -- brackets archived rows leak in and the status filter is skipped for title matches.
         SELECT COUNT(*)
           INTO p_total_count
           FROM tasks
          WHERE archived = 0
-           AND LOWER(title) LIKE v_term
-            OR LOWER(description) LIKE v_term
-           AND (p_status IS NULL OR status = p_status);
+           AND (LOWER(title) LIKE v_term ESCAPE '!'
+                OR LOWER(description) LIKE v_term ESCAPE '!')
+           AND (v_status IS NULL OR status = v_status);
 
         -- Paginated results using ROWNUM (pre-12c pattern)
         OPEN p_results FOR
@@ -64,12 +82,12 @@ CREATE OR REPLACE PACKAGE BODY task_search_pkg AS
                                assignee, created_at
                           FROM tasks
                          WHERE archived = 0
-                           AND LOWER(title) LIKE v_term
-                            OR LOWER(description) LIKE v_term
-                           AND (p_status IS NULL OR status = p_status)
-                         ORDER BY created_at DESC
+                           AND (LOWER(title) LIKE v_term ESCAPE '!'
+                                OR LOWER(description) LIKE v_term ESCAPE '!')
+                           AND (v_status IS NULL OR status = v_status)
+                         ORDER BY created_at DESC, id DESC
                     ) t
-                   WHERE ROWNUM <= v_offset + p_page_size
+                   WHERE ROWNUM <= v_offset + v_page_size
               )
              WHERE rn > v_offset;
 
